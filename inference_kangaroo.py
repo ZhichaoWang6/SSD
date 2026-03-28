@@ -242,9 +242,15 @@ def kangaroo_speculative_generate(
             print(f"\n  [Draft 汇总] 共生成 {len(draft_token_ids)} 个草稿token，停止原因: {draft_stop_reason}")
             print(f"  草稿序列: {repr(draft_text)}")
 
-        # ---- STEP 2: Verify ----
+        # ---- STEP 2+3: Sequential Verify and Accept ----
+        # Process one position at a time to ensure q_len=1 in flash attention,
+        # matching the AR decode kernel path (causal=False) for bit-identical results.
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         t_verify_start = time.perf_counter()
+
+        # Fix _seen_tokens: draft steps through layer 0 auto-incremented it,
+        # but verify layers' cache is still at start_index.
+        base_model.past_key_values._seen_tokens = start_index
 
         verify_cache_len = base_model._get_layer_cache_length(early_exit_layer)
         assert verify_cache_len == start_index, \
@@ -252,34 +258,32 @@ def kangaroo_speculative_generate(
         assert exited_hidden_states.shape[1] == end_index - start_index, \
             f"Shape mismatch: {exited_hidden_states.shape[1]} != {end_index - start_index}"
 
-        hidden_state_, hidden_state_normed = base_model.forward_draft_or_large_model(
-            in_features_large=exited_hidden_states,
-        )
-
-        logits = head_model(hidden_state_normed).float()
-        output_tokens = torch.argmax(logits, dim=-1)
-
-        if debug_verify and round_idx <= 5:
-            print(f"[DEBUG] Round {round_idx}: start={start_index_copy}, end={end_index}, "
-                  f"verify_token={_tok(tokenizer, output_tokens[0, 0].item())}, "
-                  f"top3={torch.topk(logits[0, 0], 3).indices.tolist()}")
+        output_length = end_index - start_index
+        first_mismatch = None
 
         if verbose:
             print(f"\n  [Verify] 大模型逐位验证:")
             print(f"  {'步':>4}  {'Draft预测':>18}  {'Verify结果':>18}  {'状态':>10}")
             print(f"  {'─'*60}")
 
-        # ---- STEP 3: Accept ----
-        output_length = end_index - start_index
-        first_mismatch = None
-
         for i in range(output_length):
-            is_last = (i == output_length - 1)
-            is_eos = (output_tokens[0, i].item() in token_eos_set)
-            is_mismatch = (not is_last and output_tokens[0, i] != global_tokens[0, start_index + 1 + i])
+            single_hidden = exited_hidden_states[:, i:i+1, :]
+            hidden_state_, hidden_state_normed = base_model.forward_draft_or_large_model(
+                in_features_large=single_hidden,
+            )
 
+            logits_i = head_model(hidden_state_normed).float()
+            verify_id = torch.argmax(logits_i[:, -1, :], dim=-1).item()
+
+            if debug_verify and round_idx <= 5 and i == 0:
+                print(f"[DEBUG] Round {round_idx}: start={start_index_copy}, end={end_index}, "
+                      f"verify_token={_tok(tokenizer, verify_id)}, "
+                      f"top3={torch.topk(logits_i[0, 0], 3).indices.tolist()}")
+
+            is_last = (i == output_length - 1)
+            is_eos = (verify_id in token_eos_set)
             draft_id = global_tokens[0, start_index + 1 + i].item() if i < len(draft_token_ids) else None
-            verify_id = output_tokens[0, i].item()
+            is_mismatch = (not is_last and draft_id is not None and verify_id != draft_id)
 
             if verbose:
                 draft_str = _tok(tokenizer, draft_id) if draft_id is not None else "N/A"
@@ -296,7 +300,7 @@ def kangaroo_speculative_generate(
                 print(f"  {i+1:>4}  {draft_str:>18}  {verify_str:>18}  {status:>10}")
 
             if is_last or is_eos or is_mismatch:
-                global_tokens[0, start_index + 1 + i] = output_tokens[0, i]
+                global_tokens[0, start_index + 1 + i] = verify_id
                 start_index = start_index + 1 + i
                 if is_eos:
                     stop = True

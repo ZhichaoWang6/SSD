@@ -59,8 +59,22 @@ class KangarooQwenModel(nn.Module):
             adapter_ckpt = os.path.join(adapter_model_path, 'adapter_model.bin')
             if os.path.exists(adapter_ckpt):
                 state_dict = torch.load(adapter_ckpt, map_location='cpu')
-                self.adapter_model.load_state_dict(state_dict, strict=False)
-                print(f"Loaded adapter weights from {adapter_ckpt}")
+
+                # Strip 'module.' prefix added by Accelerate/DDP wrapping
+                cleaned = {}
+                for k, v in state_dict.items():
+                    new_key = k.replace('module.', '', 1) if k.startswith('module.') else k
+                    cleaned[new_key] = v
+
+                missing, unexpected = self.adapter_model.load_state_dict(cleaned, strict=False)
+                if missing:
+                    print(f"WARNING: Adapter missing keys ({len(missing)}): {missing[:5]}")
+                if unexpected:
+                    print(f"WARNING: Adapter unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+                if not missing and not unexpected:
+                    print(f"Loaded adapter weights from {adapter_ckpt} (all {len(cleaned)} keys matched)")
+                else:
+                    print(f"Loaded adapter weights from {adapter_ckpt}")
             else:
                 print(f"Warning: adapter checkpoint not found at {adapter_ckpt}, using random weights")
 

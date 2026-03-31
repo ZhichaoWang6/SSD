@@ -117,10 +117,18 @@ class AdapterDataset(Dataset):
     def __getitem__(self, index):
         data = torch.load(self.data[index], map_location='cpu', weights_only=False)
 
-        hidden_state = data['hidden_state'][:self.max_len][None, :]
-        input_ids = data['input_ids'][:self.max_len][None, :]
-        loss_mask = data['loss_mask'][:self.max_len][None, :]
-        hidden_state_early = data[f'hidden_state_layer{self.exit_layer}'][:self.max_len][None, :]
+        # Truncate from the RIGHT (keep tail) so the assistant response
+        # at the end of the sequence is preserved.  The loss_mask marks
+        # assistant tokens which always sit at the tail.
+        seq_len = data['hidden_state'].shape[0]
+        if seq_len > self.max_len:
+            start = seq_len - self.max_len
+        else:
+            start = 0
+        hidden_state = data['hidden_state'][start:start + self.max_len][None, :]
+        input_ids = data['input_ids'][start:start + self.max_len][None, :]
+        loss_mask = data['loss_mask'][start:start + self.max_len][None, :]
+        hidden_state_early = data[f'hidden_state_layer{self.exit_layer}'][start:start + self.max_len][None, :]
 
         length = hidden_state.shape[1]
         attention_mask = [1] * length

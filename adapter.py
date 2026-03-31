@@ -198,7 +198,7 @@ class AdapterModel(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.gradient_checkpointing = True
+        self.gradient_checkpointing = False
         self.padding_idx = getattr(config, 'pad_token_id', 0)
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size

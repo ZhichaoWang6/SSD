@@ -64,36 +64,62 @@ def build_loss_mask(input_ids, tokenizer):
     """
     Create loss mask that only includes assistant response tokens.
     Uses the chat template's assistant token markers to identify response regions.
+
+    For Qwen2.5 chat format: <|im_start|>assistant\n...content...<|im_end|>
+    We mark only the content tokens (after the "assistant\n" header, before <|im_end|>).
     """
     loss_mask = torch.zeros_like(input_ids[0], dtype=torch.float32)
 
-    # Find assistant response regions by looking for the pattern after
-    # the assistant header token. For Qwen2.5, assistant turns end with <|im_end|>
     im_start_id = tokenizer.convert_tokens_to_ids('<|im_start|>')
     im_end_id = tokenizer.convert_tokens_to_ids('<|im_end|>')
+    newline_id = tokenizer.encode('\n', add_special_tokens=False)[-1]
 
     ids = input_ids[0].tolist()
+    n = len(ids)
     in_assistant = False
-    for i, token_id in enumerate(ids):
+    found_newline = False  # track whether we've passed the "assistant\n" header
+
+    i = 0
+    while i < n:
+        token_id = ids[i]
         if token_id == im_start_id:
-            # Check if next token indicates 'assistant'
-            # The pattern is: <|im_start|>assistant\n...
-            # We'll mark everything after the newline until <|im_end|>
-            in_assistant = False  # reset
-            # Look ahead for 'assistant' token
-            if i + 1 < len(ids):
-                # Decode the next few tokens to check role
-                snippet = tokenizer.decode(ids[i+1:min(i+10, len(ids))], skip_special_tokens=False)
+            in_assistant = False
+            found_newline = False
+            # Look ahead to check if this is an assistant turn
+            if i + 1 < n:
+                snippet = tokenizer.decode(
+                    ids[i+1:min(i+10, n)], skip_special_tokens=False
+                ).lstrip()
                 if snippet.startswith('assistant'):
                     in_assistant = True
-                    continue
+                    # Skip past <|im_start|>, "assistant", and "\n" tokens
+                    # Find the newline that ends the role header
+                    j = i + 1
+                    while j < n and ids[j] != newline_id:
+                        j += 1
+                    if j < n:
+                        i = j + 1  # skip past the newline
+                        found_newline = True
+                        continue
+            i += 1
+            continue
         elif token_id == im_end_id:
-            if in_assistant:
-                in_assistant = False
+            in_assistant = False
+            found_newline = False
+            i += 1
             continue
 
-        if in_assistant:
+        if in_assistant and found_newline:
             loss_mask[i] = 1.0
+        i += 1
+
+    num_marked = int(loss_mask.sum().item())
+    if num_marked == 0:
+        # Decode full sequence for debugging
+        full_text = tokenizer.decode(ids[:200], skip_special_tokens=False)
+        print(f"WARNING: build_loss_mask found 0 assistant tokens! "
+              f"Sequence length={n}, im_start_id={im_start_id}, im_end_id={im_end_id}")
+        print(f"  First 200 tokens decoded: {repr(full_text[:300])}")
 
     return loss_mask
 

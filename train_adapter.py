@@ -162,6 +162,9 @@ class AdapterDataset(Dataset):
         zeropadding = torch.zeros(1, 1, target.shape[2])
         hidden_state_early = torch.cat((hidden_state_early, zeropadding), dim=1)
 
+        # Shift loss_mask to align with shifted hidden states:
+        # hidden_state_early[i] = original position i+1, so loss_mask should also shift
+        loss_mask = loss_mask[1:] + [0]
         loss_mask[-1] = 0
         new_data["attention_mask"] = attention_mask
         new_data["loss_mask"] = loss_mask
@@ -230,6 +233,32 @@ print(f"Training: {len(traindatapath)} samples, Testing: {len(testdatapath)} sam
 traindataset = AdapterDataset(traindatapath, args.exit_layer, args.max_len)
 testdataset = AdapterDataset(testdatapath, args.exit_layer, args.max_len)
 
+# Diagnostic: check loss_mask coverage in training data
+if accelerator.is_main_process:
+    print("\n[Data Diagnostic] Checking loss_mask in first 20 training samples...")
+    num_empty = 0
+    for idx in range(min(20, len(traindataset))):
+        sample = traindataset[idx]
+        mask_sum = sum(sample["loss_mask"])
+        mask_len = len(sample["loss_mask"])
+        if mask_sum == 0:
+            num_empty += 1
+            # Load raw data for debugging
+            raw = torch.load(traindatapath[idx], map_location='cpu')
+            raw_mask_sum = raw['loss_mask'].sum().item()
+            print(f"  Sample {idx}: loss_mask all ZERO (len={mask_len}, "
+                  f"raw_mask_sum={raw_mask_sum:.0f})")
+        else:
+            print(f"  Sample {idx}: loss_mask has {mask_sum:.0f}/{mask_len} active positions")
+    if num_empty > 0:
+        print(f"  WARNING: {num_empty}/20 samples have empty loss_mask! "
+              f"Training will be ineffective.")
+        print(f"  → Check that your training data has assistant responses")
+        print(f"  → If raw_mask_sum is also 0, regenerate data with fixed build_loss_mask()")
+        print(f"  → If raw_mask_sum > 0 but mask is 0 after processing, "
+              f"check max_len={args.max_len} truncation")
+    print()
+
 train_loader = DataLoader(
     traindataset, batch_size=args.bs, shuffle=True,
     collate_fn=DataCollatorWithPadding(), num_workers=4, pin_memory=True,
@@ -291,8 +320,12 @@ for epoch in range(args.start_epoch, args.start_epoch + args.num_epochs):
 
         out_logp = nn.LogSoftmax(dim=2)(out_head)
         loss_mask = data["loss_mask"][:, :, None]
+        mask_sum = loss_mask.sum()
+        if mask_sum == 0:
+            # Skip batches with no supervised positions to avoid 0/0 NaN
+            continue
         plogp = target_p * out_logp
-        loss = -torch.sum(torch.sum(loss_mask * plogp, 2)) / loss_mask.sum()
+        loss = -torch.sum(torch.sum(loss_mask * plogp, 2)) / mask_sum
         prob_acc = torch.sum(data["loss_mask"] * prob_acc) / data["loss_mask"].sum()
 
         if accelerator.is_main_process and batch_idx % args.log_steps == 0:
